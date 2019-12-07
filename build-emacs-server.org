@@ -1,0 +1,171 @@
+#+TITLE: 实现 Emacs Server
+
+本文有两个目的：
+1. 介绍 Emacs Server 的原理
+2. 实现一个基于 HTTP/JSON 的 Emacs Server
+
+* Emacs Server 是如何工作的？
+
+Emacs Server 使用一个运行在 Unix domain socket 或 TCP 上的纯文件协议，这个协议很简单。比如命令：
+
+#+BEGIN_EXAMPLE
+~ $ emacsclient --eval '(+ 1 2)'
+3
+#+END_EXAMPLE
+
+其实 emacsclient 发送：
+
+#+BEGIN_EXAMPLE
+-eval (+ 1 2)
+#+END_EXAMPLE
+
+然后 Emacs server 返回：
+
+#+BEGIN_EXAMPLE
+-print 3
+#+END_EXAMPLE
+
+不信自己用 netcat 或者 telnet 命令试一下：
+
+#+BEGIN_EXAMPLE
+~ $ emacsclient --eval server-socket-dir server-name
+"/var/folders/7f/s191h4q97p90374yw15ssrs00000gn/T//emacs501"
+"server"
+~ $ nc -U /var/folders/7f/s191h4q97p90374yw15ssrs00000gn/T//emacs501/server
+-eval (+&_1&_2)
+-emacs-pid 63977
+-print 3
+#+END_EXAMPLE
+
+=-eval= 和 =-print= 的意思一目了然， =C-h f server-process-filter= 也有说明，比较常用的有：
+
+| 指令        | 描述     |
+|-------------+----------|
+| -file       | 打开文件 |
+| -dir        | 工作路径 |
+| -position   | 指定位置 |
+| -eval       | 执行代码 |
+| -print      | 执行结果 |
+| -print-nonl | 更多结果 |
+
+注意到上面的 nc 命令中，我发送的是 ~(+&_1&_2)~ ，这是 Quote 的结果
+
+#+BEGIN_SRC elisp
+(server-quote-arg "(+ 1 2)")
+;; => "(+&_1&_2)"
+#+END_SRC
+
+** 总结
+
+了解到以下几点，就掌握了 Emacs Server 的原理了：
+
+1. 基于 Unix Socket Domain 或 TCP 的纯文本协议
+2. 服务器和客户端指令，如 -file, -eval, -print，见 =C-h f server-process-filter=
+3. Escape 发送参数和 unescape 返回参数，见 =server-quote-arg= 和 =server-unquote-arg=
+
+接下来你就可以用喜欢的编程语言实现 emacsclient 了，或者实现一个新的 Emacs Server 了。
+
+* 实现一个基于 HTTP/JSON 的 Emacs Server
+
+协议：
+
+#+BEGIN_EXAMPLE
+# Success
+{"eval": "(+ 1 2)"} -> Emacs Server -> {"result": 3}
+
+# Failure
+{"eval": "(/ 1 0)"} -> Emacs Server -> {"error": "Arithmetic error"}
+#+END_EXAMPLE
+
+启动一个 TCP Server，端口号 3000：
+
+#+BEGIN_SRC elisp
+(defun my-emacs-server ()
+  (interactive)
+  (make-network-process
+   :name "My-Emacs-Server"
+   :buffer "*My-Emacs-Server*"
+   :server t
+   :service 3000
+   :filter #'my-emacs-server-process-filter))
+#+END_SRC
+
+使用函数 =my-emacs-server-process-filter= 来处理请求，Process Filter 的参数表为：
+
+#+BEGIN_EXAMPLE
+(process output)
+#+END_EXAMPLE
+
+其中，
+
+- =process= 一般就是 =:filter= 所在的 Process，但对于 Network Connections 服务器来说，它是客户端的 Process，而不是服务器的 Process
+- =output= 自然就是 HTTP 请求，因为我们要把这个 TCP Server 当作 HTTP Web Server
+
+我们无视任何 HTTP Request Header，而假设 Body 是就是个 JSON 文档：
+
+#+BEGIN_SRC elisp
+(with-temp-buffer
+  (insert output)
+  (goto-char (point-min))
+  (re-search-forward "^\r\n" nil t)
+  (json-read))
+#+END_SRC
+
+完整的 Filter：
+
+#+BEGIN_SRC elisp
+(defun my-emacs-server-process-filter (process output)
+  (let (json result erro resp-body)
+    (with-temp-buffer
+      (insert output)
+      (goto-char (point-min))
+      (re-search-forward "^\r\n" nil t)
+      (condition-case err
+          (setq json (json-read))
+        (json-error
+         (setq erro (format
+                     "client error: json decode error: %s"
+                     (error-message-string erro))))))
+    (cond
+     ((null json)
+      (setq erro (format "client error: empty json")))
+     ((not (listp json))
+      (setq erro (format "client error: invaid json: %s" json)))
+     (t
+      (let ((expr (alist-get 'eval json)))
+        (if expr
+            (condition-case err
+                (setq result (eval (read expr)))
+              (error (setq erro err)))
+          (setq erro (format "client error: invalid json: missing \"eval\": %s" json))))))
+    (when result
+      (condition-case err
+          (json-encode result)
+        (json-error
+         (setq erro (format
+                     "server error: json encode error: %s"
+                     (error-message-string err))))))
+    (setq resp-body
+          (cond
+           (erro (json-encode
+                  `((error . ,(if (stringp erro) erro (error-message-string erro))))))
+           (result (json-encode
+                    `((result . ,result))))
+           (t (error "panic: either erro or result must be set"))))
+    (process-send-string process "HTTP/1.1 200 OK\r\n")
+    (process-send-string process "Content-Type: application/json\r\n")
+    (process-send-string process (format "Content-Length: %d\r\n" (string-bytes resp-body)))
+    (process-send-string process "\r\n")
+    (process-send-string process resp-body)
+    (process-send-eof process)))
+#+END_SRC
+
+测试：
+
+#+BEGIN_EXAMPLE
+~ $ curl localhost:3000 -d '{"eval": "(+ 1 2)"}'
+{"result":3}
+
+~ $ curl localhost:3000 -d '{"eval": "(/ 1 0)"}'
+{"error":"Arithmetic error"}
+#+END_EXAMPLE
