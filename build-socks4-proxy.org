@@ -1,0 +1,143 @@
+#+TITLE: 实现 SOCKS4 proxy
+
+不像 HTTP Proxy 只能处理 HTTP 数据，SOCKS Proxy 能处理任意 TCP 数据（如 FTP, SMTP, HTTP）。本文有两个目的：
+
+1. 介绍 SOCKS4 协议
+2. 实现 SOCKS4 Proxy Server
+
+* SOCKS4 协议
+
+https://en.wikipedia.org/wiki/SOCKS#SOCKS4
+
+SOCKS4 有两步，第一步建立连接，客户端向 SOCKS4 Proxy Server 发送：
+
+#+BEGIN_SRC elisp
+;; (info "(elisp) Bindat Spec")
+((VER     u8)                           ; SOCKS4 版本 4
+ (CMD     u8)                           ; 命令，0x01 tcp
+ (DSTPORT u16)                          ; 目标 port
+ (DSTIP   ip)                           ; 目标 ip
+ (ID      strz (eval (- (length bindat-raw) bindat-idx))))
+#+END_SRC
+
+用 nc 充当 SOCKS4 Proxy Server 可以观察到这个请求：
+
+#+BEGIN_EXAMPLE
+~ $ nc -l 9999 | hexdump
+0000000 04 01 00 50 5d b8 d8 22 00
+0000009
+
+# 在另一个终端中执行
+~ $ curl -x socks4://127.0.0.1:9999 example.com -m 1
+curl: (7) Failed to receive SOCKS4 connect request ack
+#+END_EXAMPLE
+
+真正的 SOCKS4 Proxy Server 会返回：
+
+#+BEGIN_SRC elisp
+((RSV u8)
+ (REP u8) ; reply code, 0x5a 成功
+ (DSTPORT u16)
+ (DSTIP ip))
+#+END_SRC
+
+此时成功建立连接。第二步即 relay 所有的数据。
+
+* 实现 SOCKS4 Proxy Server
+
+SOCKS4 Proxy Server 运行在 TCP 上，先建立 TCP Server，使用 3000/tcp 端口：
+
+#+BEGIN_SRC elisp
+(make-network-process
+ :name "socks4-server"
+ :buffer "*socks4-server*"
+ :server t
+ :service 3000
+ :coding 'binary
+ :filter #'my-socks4-proxy-filter)
+#+END_SRC
+
+我们使用 Emacs 自带的 bindat.el 解码和编码二进制数据，举个例子，对着这样一个 6 bytes 的数据：
+
+#+BEGIN_EXAMPLE
+| IP (4 bytes) | PORT (2 bytes) |
+#+END_EXAMPLE
+
+分别解码和编码：
+
+#+BEGIN_SRC elisp
+(bindat-unpack
+ '((dstip ip) (dstport u16))
+ [127 0 0 1 00 80])
+;; => ((dstport . 80) (dstip . [127 0 0 1]))
+
+(vconcat
+ (bindat-pack
+  '((dstip ip) (dstport u16))
+  '((dstport . 80) (dstip . [127 0 0 1]))))
+;; => [127 0 0 1 0 80]
+#+END_SRC
+
+以下是完整实现：
+
+#+BEGIN_SRC elisp
+;; -*- lexical-binding: t; -*-
+(defun my-socks4-proxy ()
+  (interactive)
+  (make-network-process
+   :name "socks4-server"
+   :buffer "*socks4-server*"
+   :server t
+   :service 3000
+   :coding 'binary
+   :filter #'my-socks4-proxy-filter))
+
+(require 'bindat)
+
+(defconst my-socks4-proxy-request-spec
+  '((VER u8)
+    (CMD u8)
+    (DSTPORT u16)
+    (DSTIP ip)
+    (ID strz (eval (- (length bindat-raw) bindat-idx))))
+  "(elisp) Bindat Spec of first packet to server.")
+
+(defconst my-socks4-proxy-response-spec
+  '((RSV u8)
+    (REP u8)
+    (DSTPORT u16)
+    (DSTIP ip))
+  "(elisp) Bindat Spec of server response.")
+
+(defun my-socks4-proxy-filter (process output)
+  (if (not (process-get process 'out-proc))
+      (let (ip port)
+        (let-alist (bindat-unpack my-socks4-proxy-response-spec (vconcat output))
+          (setq ip (mapconcat #'number-to-string .DSTIP ".")
+                port .DSTPORT))
+        (message "[DEBUG] connecting to %s:%d" ip port)
+        (let* ((name (format "socks4-proxy: %s:%d" ip port))
+               (buffer (generate-new-buffer (format "*%s*" name)))
+               (out-proc (make-network-process
+                          :name name
+                          :buffer buffer
+                          :host ip
+                          :service port
+                          :filter (lambda (out-proc output)
+                                    (process-send-string process output)))))
+          (process-put process 'out-proc out-proc))
+        (process-send-string
+         process
+         (bindat-pack my-socks4-proxy-response-spec
+                      '((RSV . 0)
+                        (REP . #x5a)
+                        (DSTPORT . 0)
+                        (DSTIP . [0 0 0 0])))))
+    (process-send-string (process-get process 'out-proc) output)))
+#+END_SRC
+
+最后用 curl 试试看确保能工作：
+
+#+BEGIN_SRC sh
+curl -v -x socks4://127.0.0.1:3000 example.com
+#+END_SRC
