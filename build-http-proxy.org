@@ -1,0 +1,121 @@
+#+TITLE: 实现 HTTP Proxy
+
+我好奇环境变量 =http_proxy= 是如何工作，不少工具（如 curl/wget/w3m/Emacs 的 url.el）都支持它。本文有两个目的：
+
+1. HTTP Proxy 是如何工作的？
+2. 实现 HTTP Proxy Server
+
+* HTTP Proxy 是如何工作的？
+
+HTTP Proxy 也叫作 Web Proxy，顾名思义就是（仅）支持 HTTP 协议的代理：
+
+#+BEGIN_EXAMPLE
+HTTP Client <-> HTTP Proxy <-> HTTP Server
+#+END_EXAMPLE
+
+其中 HTTP Proxy 的作用是：
+
+- 接收 Client 的 HTTP Request，发送给 Server
+- 接收 Server 的 HTTP Response，发送给 Client
+
+Client 的 HTTP Request 会把第一行的 URI 改成完整的 URL，Proxy 需要把它改成正常的 HTTP Request，发送给 Server，Server 返回 HTTP Response，最后 Proxy 把收到的 HTTP Response 传给 Client 即可。
+
+#+BEGIN_EXAMPLE
+;; Client 发送
+GET http://example.com/index.html HTTP/1.1
+...
+
+;; Proxy 发送
+GET /index.html HTTP/1.1
+...
+#+END_EXAMPLE
+
+https://en.wikipedia.org/wiki/Proxy_server#Web_proxy_servers 也有解释。
+
+自己动手验证一下，curl 和 netcat 分别充当 HTTP Client 和 HTTP Proxy。启动 HTTP Proxy：
+
+#+BEGIN_EXAMPLE
+nc -l 9999
+#+END_EXAMPLE
+
+然后再通过代理访问 http://example.com ：
+
+#+BEGIN_EXAMPLE
+~ $ curl -x http://0.0.0.0:9999 example.com
+#+END_EXAMPLE
+
+随后会注意到 Proxy 收到：
+
+#+BEGIN_EXAMPLE
+~ $ nc -l 9999
+GET http://example.com/ HTTP/1.1
+Host: example.com
+User-Agent: curl/7.54.0
+Accept: */*
+Proxy-Connection: Keep-Alive
+
+#+END_EXAMPLE
+
+* 实现 HTTP Proxy Server
+
+HTTP 运行在 TCP 上，所以 HTTP Proxy Server 也就是个 TCP Server，所以首先实现 TCP Server，运行在 3000/tcp 端口：
+
+#+BEGIN_SRC elisp
+(make-network-process
+   :name "http-proxy"
+   :buffer "*http-proxy*"
+   :server t
+   :service 3000
+   :filter #'my-http-proxy-filter)
+#+END_SRC
+
+当我们接收到 HTTP 请求时，需要修改它：
+
+#+BEGIN_EXAMPLE
+GET http://example.com/index.html HTTP/1.1
+
+;; 改成
+
+GET /index.html HTTP/1.1
+#+END_EXAMPLE
+
+然后发送这个请求、传回结果。
+
+完整实现：
+
+#+BEGIN_SRC elisp :lexical t
+;; -*- lexical-binding: t; -*-
+(defun my-http-proxy-filter (process output)
+  (with-temp-buffer
+    (insert output)
+    (goto-char (point-min))
+    (re-search-forward "^.* \\(.*\\) HTTP" (line-end-position))
+    (let* ((url (match-string 1))
+           (urlobj (save-match-data
+                     (url-generic-parse-url url)))
+           (host (url-host urlobj))
+           (filename (url-filename urlobj)))
+      (goto-char (match-beginning 1))
+      (delete-region (point) (match-end 1))
+      (insert (url-filename (url-generic-parse-url url)))
+      (let* ((name (format "http-proxy: %s" host))
+             (buffer (generate-new-buffer (format "*%s*" name)))
+             (out-proc (make-network-process
+                        :name name
+                        :buffer buffer
+                        :host host
+                        ;; ignore https
+                        :service 80
+                        :filter (lambda (out-proc output)
+                                  (process-send-string process output)
+                                  ;; (process-send-eof process)
+                                  ))))
+        (process-send-region out-proc (point-min) (point-max))
+        (process-send-eof out-proc)))))
+#+END_SRC
+
+用 curl 测试下确保能工作：
+
+#+BEGIN_SRC sh
+curl -x http://0.0.0.0:3000 example.com
+#+END_SRC
