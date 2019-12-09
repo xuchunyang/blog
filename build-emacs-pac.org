@@ -1,0 +1,120 @@
+#+TITLE: 实现 Emacs 自动代理（PAC）
+
+PAC 即 [[https://en.wikipedia.org/wiki/Proxy_auto-config][Proxy auto-config - Wikipedia]] ，用来根据 URL 自动调整代理，比如遇到 baidu.com 直连，遇到 google.com 走代理。本文介绍如何让 Emacs 的 url.el 支持 PAC。
+
+* 如何用 PAC 文件？
+
+PAC 文件是一个 JavaScript 文件，其中定义了函数 =FindProxyForURL(url, host))= ，比如：
+
+#+BEGIN_SRC javascript
+function FindProxyForURL(url, host) {
+  if (host == "google.com") {
+    return "SOCKS5 0.0.0.0:1080; DIRECT"
+  }
+  return "DIRECT"
+}
+#+END_SRC
+
+我们需要 JavaScript 引擎跑 JavaScript 代码，Emacs 的 WebKit2GTK 或许能行，但 macOS 平台貌似不支持，反正我的 Emacs 不支持 WebKit，所以我们使用 Node。
+
+首先下载 PAC 文件，我用的代理工具把 PAC 文件放在 http://localhost:1089/proxy.pac ：
+
+#+BEGIN_SRC elisp
+(defconst my-pac-file
+  (let ((pac (expand-file-name "proxy.pac" temporary-file-directory)))
+    (url-copy-file "http://localhost:1089/proxy.pac" pac t)
+    pac)
+  "My PAC file.")
+#+END_SRC
+
+然后使用它，把 =FindProxyForURL(url, host))= 包装成一个 Emacs Lisp 函数：
+
+#+Begin_SRC elisp
+(defun my-find-proxy-for-url (url host)
+  "Wrapper of PAC's FindProxyForURL(url, host)."
+  (with-temp-buffer
+    (insert-file-contents my-pac-file)
+    (goto-char (point-max))
+    (insert "\n")
+    (insert (format "console.log(FindProxyForURL('%s', '%s'))" url host))
+    (let* ((outbuf (generate-new-buffer " *node output*"))
+           (status (call-process-region nil nil "node" nil outbuf)))
+      (with-current-buffer outbuf
+        (unwind-protect
+            (if (zerop status)
+                (string-trim (buffer-string))
+              (error "node failed: %s" (buffer-string)))
+          (kill-buffer outbuf))))))
+
+(my-find-proxy-for-url "https://google.com/" "google.com")
+;; => "SOCKS5 0.0.0.0:1080; SOCKS 0.0.0.0:1080; DIRECT;"
+
+(my-find-proxy-for-url "https://baidu.com/" "baidu.com")
+;; => "DIRECT;"
+#+END_SRC
+
+这个 =my-find-proxy-for-url= 每次执行都要调用 Node，算上 Node 的启动时间，它的性能会很差，但我不熟悉 Node，也不急着优化。
+
+* 如何让 url.el 使用 PAC？
+
+先介绍手动配置代理，然后自动配置代理（PAC）。
+
+** url.el 手动配置代理
+
+url.el 支持 HTTP 和 SOCKS 4/5 代理，相关的配置有：
+
+- =url-proxy-services=
+- =socks-server=
+- =url-gateway-method=
+- =url-gateway-local-host-regexp=
+
+我记不清怎么设置了，我自己没有设置任何代理，我搜索了下 Emacs China，大概是：
+
+#+BEGIN_SRC elisp
+;; 设置 HTTP 代理
+(setq url-proxy-services
+      `(("http_proxy"  . "http://0.0.0.0:1087")
+        ("https_proxy" . "http://0.0.0.0:1087")
+        ("no_proxy"    . ,(rx bos "baidu.com" eos))))
+#+END_SRC
+
+#+BEGIN_SRC elisp
+;; 设置 SOCKS 代理
+(setq url-gateway-method 'socks
+      socks-server '("Default server" "socks" 1080 5))
+#+END_SRC
+
+HTTP 和 SOCKS 代理显然只应该设置一个，虽然似乎走两次代理没问题？
+
+** url.el 自动代理（PAC）
+
+url.el 中有个 url-proxy.el 专门处理代理，本来设置下变量 =url-proxy-locator= 就行，但 =url-find-proxy-for-url= 看起来不支持 SOCKS5 指令（我的 PAC 用到了），有时间应该提交个 Bug Report，所以我们自己修改 =url-find-proxy-for-url= 函数试试
+
+#+BEGIN_SRC elisp
+(define-advice url-find-proxy-for-url (:override (urlobj host) pac)
+  "Find proxy according to PAC."
+  (let* ((s (my-find-proxy-for-url (url-recreate-url urlobj) host))
+         (proxies (split-string s ";" t " +"))
+         (proxy (upcase (car proxies))))
+    (pcase proxy
+      ((rx "SOCKS5 " (let host+port (1+ nonl)))
+       (concat "socks5://" host+port))
+      ((rx "HTTP " (let host+port (1+ nonl)))
+       (concat "http://" host+port))
+      (_ nil))))
+#+END_SRC
+
+=M-x eww https://google.com= 试了下，报错：
+
+#+BEGIN_EXAMPLE
+helm-M-x: Don't know how to use proxy `#s(url socks nil nil 0.0.0.0 1080  nil nil t nil t t)'
+#+END_EXAMPLE
+
+看了下 =url-proxy= 函数，它居然只支持 http 代理，我不知道怎么用 SOCKS 代理，Bug？
+
+我把 PAC 中的 SOCKS 代理改成 HTTP 代理之后，之后是可行的 =M-x eww https://www.wikipedia.org= 。
+
+#+Begin_SRC javascript
+// var proxy = "SOCKS5 0.0.0.0:1080; SOCKS 0.0.0.0:1080; DIRECT;";
+var proxy = "HTTP 0.0.0.0:1087; DIRECT;";
+#+END_SRC
