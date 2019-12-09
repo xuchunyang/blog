@@ -1,0 +1,221 @@
+#+TITLE: 实现 ping
+
+ping 是 ICMP 的一个应用，ICMP 使用 IP：
+
+#+BEGIN_EXAMPLE
+       一个 IP 报文
+┌───────────┬──────────────┐
+│ IP Header │ ICMP message │
+└───────────┴──────────────┘
+#+END_EXAMPLE
+
+要操作 ICMP 就要直接操作 IP，就得用 Raw Socket。Emacs 不支持 Raw Socket，所以我们使用 Go。
+
+* 创建 Raw Socket
+
+使用 net.Dial：
+
+#+BEGIN_SRC go
+conn, err := net.Dial("ip:1", "example.com")
+if err != nil {
+	log.Fatal(err)
+}
+conn.Close()
+#+END_SRC
+
+其中 =ip:1= 的数字 1 表示 ICMP 的协议号，各个协议的编号由 [[https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml][Protocol Numbers]] 规定。net.Dial 也允许直接写协议名，所以 ="ip:icmp"= 是一样的。
+
+创建 Raw Socket 需要管理员权限，不然会报错：
+
+#+BEGIN_EXAMPLE
+$ ./pingo 
+2019/12/09 17:21:43 dial ip:1 93.184.216.34: socket: operation not permitted
+$ sudo ./pingo 
+#+END_EXAMPLE
+
+* 发送一个 ICMP Echo Request
+
+用 icmp.Message 创建一个 ICMP 报文：
+
+#+BEGIN_SRC go
+const (
+	// ICMP Payload
+	Payload = "HELLO"
+)
+
+func send(c net.Conn, seq int) error {
+	req := icmp.Message{
+		Type: ipv4.ICMPTypeEcho,
+		Body: &icmp.Echo{
+			ID:   os.Getpid(),
+			Seq:  seq,
+			Data: []byte(Payload),
+		}}
+	buf, err := req.Marshal(nil)
+	if err != nil {
+		return err
+	}
+	_, err = c.Write(buf)
+	return err
+}
+#+END_SRC
+
+用 tcpdump 测试下可以发现的确发送成功了，0.16 秒后便收到结果了
+
+#+BEGIN_EXAMPLE
+$ sudo tcpdump -A icmp
+tcpdump: data link type PKTAP
+tcpdump: verbose output suppressed, use -v or -vv for full protocol decode
+listening on pktap, link-type PKTAP (Apple DLT_PKTAP), capture size 262144 bytes
+18:53:33.465634 IP 192.168.1.100 > 93.184.216.34: ICMP echo request, id 14939, seq 0, length 13
+.F..e.H...pW..E..!;...@.Gm...d].."....:[..HELLO
+18:53:33.626474 IP 93.184.216.34 > 192.168.1.100: ICMP echo reply, id 14939, seq 0, length 13
+H...pW.F..e...E..!Y-..4.5.].."...d....:[..HELLO
+^C
+2 packets captured
+50 packets received by filter
+0 packets dropped by kernel
+#+END_EXAMPLE
+
+* 接收一个 ICMP Echo Reply
+
+我不清楚怎么知道是否接收到了全部数据，先假设返回 ICMP Echo Reply 的大小和 Request 大小相同，都是 20 (IP header) + 8 (ICMP header) + 5 (length of "HELLO") = 23 bytes。
+
+#+BEGIN_SRC go
+func recv(c net.Conn) (icmp_seq int, ttl int, err error) {
+	// IP 报文大小，20 (IP header), 8 (ICMP header)
+	const length = 20 + 8 + len(Payload)
+	buf := make([]byte, length)
+	_, err = io.ReadFull(c, buf)
+	if err != nil {
+		return
+	}
+	iph, err := icmp.ParseIPv4Header(buf)
+	if err != nil {
+		return
+	}
+	ttl = iph.TTL
+	msg, err := icmp.ParseMessage(1, buf[20:])
+	if err != nil {
+		return
+	}
+	icmp_seq = msg.Body.(*icmp.Echo).Seq
+	return
+}
+#+END_SRC
+
+
+* 重复
+
+写个死循环发送和接收 ICMP Echo Request/Reply，中间停顿一秒：
+
+#+BEGIN_SRC go
+for {
+	start := time.Now()
+	if err := send(conn, 0); err != nil {
+		log.Fatal(err)
+	}
+	seq, ttl, err := recv(conn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("icmp_seq=%d, ttl=%d, time=%s\n", seq, ttl, time.Since(start))
+	time.Sleep(1 * time.Second)
+}
+#+END_SRC
+
+* 完整代码
+
+#+BEGIN_SRC go
+package main
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"time"
+
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+)
+
+func main() {
+	conn, err := net.Dial("ip:1", os.Args[1])
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	for {
+		start := time.Now()
+		if err := send(conn, 0); err != nil {
+			log.Fatal(err)
+		}
+		seq, ttl, err := recv(conn)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("icmp_seq=%d, ttl=%d, time=%s\n", seq, ttl, time.Since(start))
+		time.Sleep(1 * time.Second)
+	}
+}
+
+const (
+	Payload = "HELLO"
+)
+
+func send(c net.Conn, seq int) error {
+	req := icmp.Message{
+		Type: ipv4.ICMPTypeEcho,
+		Body: &icmp.Echo{
+			ID:   os.Getpid(),
+			Seq:  seq,
+			Data: []byte(Payload),
+		}}
+	buf, err := req.Marshal(nil)
+	if err != nil {
+		return err
+	}
+	_, err = c.Write(buf)
+	return err
+}
+
+func recv(c net.Conn) (icmp_seq int, ttl int, err error) {
+	// IP 报文大小，20 (IP header), 8 (ICMP header)
+	const length = 20 + 8 + len(Payload)
+	buf := make([]byte, length)
+	_, err = io.ReadFull(c, buf)
+	if err != nil {
+		return
+	}
+	iph, err := icmp.ParseIPv4Header(buf)
+	if err != nil {
+		return
+	}
+	ttl = iph.TTL
+	msg, err := icmp.ParseMessage(1, buf[20:])
+	if err != nil {
+		return
+	}
+	icmp_seq = msg.Body.(*icmp.Echo).Seq
+	return
+}
+#+END_SRC
+
+测试：
+
+#+BEGIN_EXAMPLE
+$ sudo go run . baidu.com
+icmp_seq=0, ttl=53, time=42.891978ms
+icmp_seq=0, ttl=53, time=27.27945ms
+icmp_seq=0, ttl=53, time=31.161625ms
+icmp_seq=0, ttl=53, time=26.858205ms
+icmp_seq=0, ttl=53, time=27.899452ms
+icmp_seq=0, ttl=53, time=28.694112ms
+icmp_seq=0, ttl=53, time=28.205235ms
+icmp_seq=0, ttl=53, time=27.590172ms
+^Csignal: interrupt
+$
+#+END_EXAMPLE
