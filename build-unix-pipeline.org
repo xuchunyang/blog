@@ -1,0 +1,133 @@
+#+TITLE: 实现 Unix Shell Pipeline
+
+Shell 如 Bash 接收用户输入的命令，执行，然后输出结果。命令可以串联起来，前一个命令的 STDOUT 作为后面一个命令的 STDIN，比如：
+
+#+BEGIN_EXAMPLE
+~ $ date | nl
+     1	Tue Dec 10 11:15:37 CST 2019
+~ $
+#+END_EXAMPLE
+
+=|= 是 Bssh 语法规定，这个字符没有特别含义。如果你自己实现 Shell ，可以规定 Pipeline 写法是 =("date" "nl")= 。
+
+[[https://en.wikipedia.org/wiki/Pipeline_(Unix)#Implementation][Pipeline (Unix) - Wikipedia]] 指出 Pipeline 可用系统调用 =pipe(2)= 创建，因为我不熟悉 C，先不管它，本文打算用两种方式实现：
+
+- 同步方式，date 执行完 nl 才开始执行，用 Emacs 实现
+- 异步方式，date 和 nl 同时开始执行，用 Go 实现
+
+* 同步方式
+
+目标是实现函数 =pipeline= ：
+
+#+BEGIN_SRC elisp
+(pipeline "date" "nl")
+;; => "  1  Tue Dec 10 11:15:37 CST 2019"
+#+END_SRC
+
+依次执行命令，并且把前一个命令的 STDOUT 当作后一个命令的 STDIN：
+
+#+BEGIN_SRC elisp
+(defun pipeline (&rest commands)
+  (with-temp-buffer
+    (dolist (cmd commands)
+      (call-process-region (point-min) (point-max) cmd t t))
+    (buffer-string)))
+#+END_SRC
+
+上面用到的 =call-process-region= 会把整个 Buffer 作为 STDIN 传入给程序，后面两个 t 分别对应 DELETE 和 BUFFER 参数，分别用来删除旧输出和插入新输出。
+
+试一试：
+
+#+BEGIN_SRC elisp
+(pipeline "date" "nl")
+"     1	Tue Dec 10 11:46:09 CST 2019
+"
+
+(pipeline "pwd" "nl" "rev")
+"ycx/sresU/	1     
+"
+#+END_SRC
+
+同步方式实现简单可靠，但 pipeline 一般是异步方式实现的，因为如 =find / | nl= 大家肯定不想等半天才有输出，边执行边输出，用户体验更好，半天没动静，我就会怀疑是不是卡死了。
+
+Eshell 也支持 Pipelines，而且用的是异步方式，参见 =eshell-execute-pipeline= ，但我我印象中效果（性能）不好，数据量稍微大就会卡（试试 =yes | nl= ），毕竟 Emacs 是个文本编辑器，而不是 OS ，我暂时也不想深究。
+
+* 异步方式
+
+=io.Pipe= 可以创建 Pipeline，不过有现成的 =exec.Cmd.StdoutPipe= ，以 =date | nl= 为例：
+
+#+BEGIN_SRC go
+c1 := exec.Command("date")
+c2 := exec.Command("nl")
+
+// 把 date 的输出当作 nl 的输入
+in, _ := c1.StdoutPipe()
+c2.Stdin = in
+
+// 打印结果
+c2.Stdout = os.Stdout
+
+// 开始执行命令（异步）
+c1.Start()
+c2.Start()
+
+// 等待 nl 结束
+c2.Wait()
+#+END_SRC
+
+随后扩展到任意数量 =a | b | c | d= ：
+
+#+BEGIN_SRC go
+package main
+
+import (
+	"io"
+	"log"
+	"os"
+	"os/exec"
+)
+
+func Must(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func pipeline(commands ...string) {
+	var cmds []*exec.Cmd
+	var cmd *exec.Cmd
+	var in io.ReadCloser = os.Stdin
+	for _, c := range commands {
+		cmd = exec.Command(c)
+		cmds = append(cmds, cmd)
+		cmd.Stdin = in
+		var err error
+		in, err = cmd.StdoutPipe()
+		Must(err)
+	}
+	cmd.Stdout = os.Stdout
+
+	for _, cmd := range cmds {
+		Must(cmd.Start())
+	}
+	Must(cmd.Wait())
+}
+
+func main() {
+	pipeline(os.Args[1:]...)
+}
+#+END_SRC
+
+试一下：
+
+#+BEGIN_EXAMPLE
+$ go run . cal rev nl rev nl
+     1	   December 2019      	1     
+     2	Su Mo Tu We Th Fr Sa  	2     
+     3	 1  2  3  4  5  6  7  	3     
+     4	 8  9 10 11 12 13 14  	4     
+     5	15 16 17 18 19 20 21  	5     
+     6	22 23 24 25 26 27 28  	6     
+     7	29 30 31              	7     
+     8	                      	8     
+#+END_EXAMPLE
