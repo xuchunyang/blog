@@ -1,0 +1,136 @@
+#+TITLE: 实现 DICT 客户端
+
+DICT (the dictionary server protocl) 是一个网络字典协议，由 RFC 2229 规定。本文有两个目标：
+
+1. 介绍 DICT 协议
+2. 实现 DICT 客户端
+
+* DICT 协议
+
+DICT 使用 2628/tcp 通信，客户端问，服务器答。
+
+下面我用 =DEFINE foldoc vim= 查询 vim 在 [[http://foldoc.org/][FOLDOC - Computing Dictionary]] 的定义，最后用 =QUIT= 退出，其余的文字都是服务器返回的。
+
+#+BEGIN_EXAMPLE
+~ $ nc dict.org 2628
+220 pan.alephnull.com dictd 1.12.1/rf on Linux 4.4.0-1-amd64 <auth.mime> <91148263.26219.1575962026@pan.alephnull.com>
+DEFINE foldoc vim
+150 1 definitions retrieved
+151 "vim" foldoc "The Free On-line Dictionary of Computing (18 March 2015)"
+VIM
+
+   1. <messaging> {Vendor Independent Messaging}.
+
+   2. <text, tool> {Vi Improved}.
+
+   (1999-06-15)
+
+.
+250 ok [d/m/c = 1/0/12; 0.000r 0.000u 0.000s]
+QUIT
+221 bye [d/m/c = 0/0/0; 13.000r 0.000u 0.000s]
+~ $
+#+END_EXAMPLE
+
+RFC 2229 还规定了 [[https://tools.ietf.org/html/rfc2229#section-5][dict://]] 的含义：
+
+#+BEGIN_EXAMPLE
+dict://<user>;<auth>@<host>:<port>/d:<word>:<database>:<n>
+dict://<user>;<auth>@<host>:<port>/m:<word>:<database>:<strat>:<n>
+#+END_EXAMPLE
+
+curl 支持这个 =dict://= ，https://curl.haxx.se/docs/manual.html 有介绍，举个例子，还是看看 Vim 是什么意思：
+
+#+BEGIN_EXAMPLE
+~ $ curl dict://dict.org/d:vim:foldoc
+220 pan.alephnull.com dictd 1.12.1/rf on Linux 4.4.0-1-amd64 <auth.mime> <91149491.28932.1575962481@pan.alephnull.com>
+250 ok
+150 1 definitions retrieved
+151 "vim" foldoc "The Free On-line Dictionary of Computing (18 March 2015)"
+VIM
+
+   1. <messaging> {Vendor Independent Messaging}.
+
+   2. <text, tool> {Vi Improved}.
+
+   (1999-06-15)
+
+.
+250 ok [d/m/c = 1/0/12; 0.000r 0.000u 0.000s]
+221 bye [d/m/c = 0/0/0; 0.000r 0.000u 0.000s]
+~ $
+#+END_EXAMPLE
+
+curl 用 -v 也不会打印它发送的命令，可以用 =sudo tcpdump tcp port 2628 -A -v= 观察。
+
+注意 macOS 的 Dictionary.app 也支持 =dict://= ，但是这个两个没关系，Dictionary.app 不支持 DICT 协议。
+
+#+BEGIN_EXAMPLE
+# 用 Dictionary.app 查询 banana
+open dict://banana
+
+# 用 DICT 协议查询 banana
+curl dict://dict.org/d:banana
+#+END_EXAMPLE
+
+* 实现 DICT 客户端
+
+DICT 客户端不少，我用过的就有：
+
+1. curl
+2. dictionary.el
+
+下面要实现的 DICT 客户端只支持查词，也就是 dict://dict.org/d:<WORD> 。
+
+#+BEGIN_SRC go
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"log"
+	"net"
+	"os"
+)
+
+func main() {
+	word := os.Args[1]
+
+	conn, err := net.Dial("tcp", "dict.org:2628")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	input := bufio.NewScanner(conn)
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		for i := 0; input.Scan(); i++ {
+			if i == 0 {
+				close(ready)
+			}
+			fmt.Println(input.Text())
+		}
+		close(done)
+	}()
+	<-ready
+	define(conn, word)
+	quit(conn)
+	<-done
+}
+
+func define(conn net.Conn, word string) error {
+	_, err := fmt.Fprintf(conn, "DEFINE ! %s\n", word)
+	return err
+}
+
+func quit(conn net.Conn) error {
+	_, err := fmt.Fprintf(conn, "QUIT\n")
+	return err
+}
+#+END_SRC
+
+我用了个 ready channel 来等待连接后服务器的首次返回，不过好像没必要？就算不等服务器应该也能正常工作？
+
+Go 的 x/net/dict 也实现了一个 DICT 客户端，以后用看看，在学习下它的代码（如用到的 net/textproto）。
