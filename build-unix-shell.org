@@ -1,0 +1,200 @@
+#+TITLE: 实现 Unix Shell
+
+Unix Shell 是一个执行命令的程序，以 Bash 为代表。下面用 Go 实现一个简单的交互 Shell（如果一定要有个名字的话，可以叫做 Gosh），特性有：
+
+1. 执行命令，如 =ls -l=
+2. 支持管道，如 =ls -l | nl=
+3. 内置命令，如 =cd=
+
+其它特性，如重定向 (=cat < file1 > file2=)、Job control (=vim &=)、Glob (=*.txt=) 等，都不支持。
+
+* REPL 循环
+
+REPL 是 Read-Eval-Print-Loop 的缩写。用 bufio.Scanner 来按行读取用户输入，Eval 部分暂时用 TODO 代替：
+
+#+BEGIN_SRC go
+const prompt = "$ "
+input := bufio.NewScanner(os.Stdin)
+fmt.Print(prompt)
+for input.Scan() {
+	fmt.Printf("TODO: Run %q\n", input.Text())
+	fmt.Print(prompt)	
+}
+#+END_SRC
+
+效果：
+
+#+BEGIN_EXAMPLE
+$ hello world
+TODO: Run "hello world"
+$ all good
+TODO: Run "all good"
+$ 
+#+END_EXAMPLE
+
+如果需要 Emacs 快捷键，比如 C-a，还得用 Readline 或者类似的库。
+
+* 解析命令行
+
+Gosh 命令行支持管道，要把 =ls -A | wc -l= 解析成 =[[ls -A] [wc -l]]=
+
+#+BEGIN_SRC go
+func Parse(s string) (commands [][]string) {
+	for _, c := range strings.Split(s, "|") {
+		c = strings.TrimSpace(c)
+		if c != "" {
+			commands = append(commands, strings.Fields(c))
+		}
+	}
+	return
+}
+#+END_SRC
+
+* 执行命令行
+
+昨天我已经实现过管道了（依次把 STDIN 设为 前一个命令的 STDOUT 就行了）：
+
+#+BEGIN_SRC go
+func Pipeline(commands [][]string) error {
+	if len(commands) == 0 {
+		return nil
+	}
+
+	var cmds []*exec.Cmd
+	var cmd *exec.Cmd
+	var in io.ReadCloser = os.Stdin
+	for _, c := range commands {
+		cmd = exec.Command(c[0], c[1:]...)
+		cmds = append(cmds, cmd)
+		cmd.Stdin = in
+		var err error
+		in, err = cmd.StdoutPipe()
+		if err != nil {
+			return err
+		}
+	}
+	cmd.Stdout = os.Stdout
+	for _, cmd := range cmds {
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+	}
+	return cmd.Wait()
+}
+#+END_SRC
+
+* cd
+
+外部程序没办法修改 shell 自身工作路径，我们必须自己实现一个内置的 =cd= ，有关讨论：
+
+[[https://unix.stackexchange.com/questions/38808/why-is-cd-not-a-program][shell - Why is cd not a program? - Unix & Linux Stack Exchange]]
+
+直接用 =os.Chdir= 切换目录，它支持相对路径，如 =os.Chdir("..")= 。顺便再改下提示符，显示当前工作路径：
+
+#+BEGIN_SRC go
+func prompt() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		log.Fatal(err)
+	}
+	return dir + " $ "
+}
+#+END_SRC
+
+* 全部代码
+
+总共 84 行。
+
+#+BEGIN_SRC go
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"os/exec"
+	"strings"
+)
+
+func Parse(s string) (commands [][]string) {
+	for _, c := range strings.Split(s, "|") {
+		c = strings.TrimSpace(c)
+		if c != "" {
+			commands = append(commands, strings.Fields(c))
+		}
+	}
+	return
+}
+
+func Pipeline(commands [][]string) error {
+	if len(commands) == 0 {
+		return nil
+	}
+
+	var cmds []*exec.Cmd
+	var cmd *exec.Cmd
+	var in io.ReadCloser = os.Stdin
+	for _, c := range commands {
+		cmd = exec.Command(c[0], c[1:]...)
+		cmds = append(cmds, cmd)
+		cmd.Stdin = in
+		cmd.Stderr = os.Stdout
+		var err error
+		in, err = cmd.StdoutPipe()
+		if err != nil {
+			return err
+		}
+	}
+	cmd.Stdout = os.Stdout
+	for _, cmd := range cmds {
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+	}
+	return cmd.Wait()
+}
+
+func prompt() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		log.Fatal(err)
+	}
+	return dir + " $ "
+}
+
+func main() {
+	input := bufio.NewScanner(os.Stdin)
+	fmt.Print(prompt())
+	for input.Scan() {
+		var err error
+		s := strings.TrimSpace(input.Text())
+		switch {
+		case s == "cd":
+			var dir string
+			dir, err = os.UserHomeDir()
+			if err != nil {
+				break
+			}
+			err = os.Chdir(dir)
+		case strings.HasPrefix(s, "cd "):
+			dir := s[3:]
+			err = os.Chdir(dir)
+		default:
+			err = Pipeline(Parse(s))
+		}
+		if err != nil {
+			log.Print(err)
+		}
+		fmt.Print(prompt())
+	}
+}
+#+END_SRC
+
+* 网上的教程
+
+- [[https://www.cs.cornell.edu/courses/cs414/2004su/homework/shell/shell.html][Writing Your Own Shell]]
+- [[https://brennan.io/2015/01/16/write-a-shell-in-c/][Tutorial - Write a Shell in C • Stephen Brennan]]
+- [[https://indradhanush.github.io/blog/writing-a-unix-shell-part-1/][Writing a Unix Shell - Part I – Cracking The Code]]
+- [[https://danishpraka.sh/2018/09/27/shell-in-python.html][Write a shell in Python]]
