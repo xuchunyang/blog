@@ -1,0 +1,377 @@
+#+TITLE: 实现终端 Pager
+
+我想实现一个终端 Pager，类似于 less(1)，当然功能要少很多，只要能用就 OK 了，也就是能
+
+1. 显示文本
+2. 按行和按屏上下滚屏
+
+我打算用 Go 实现，用 =golang.org/x/sys/unix= 控制终端，不使用其它任何第三方库。
+
+终端环境或许比浏览器环境还费解，一大堆历史遗留的术语：
+
+- Terminal, TTY, Terminal Emulator
+- Shell, CLI
+- Termios, Termcap, Terminfo, Curses, Ncurses, Readline
+
+我想了解也不知从何入手，好在 AUPE3e 的第18章和 TLPI 的第62章都有介绍。
+
+* 终端进入 Raw mode
+
+终端的输入输出有两种模式：
+
+1. 规范模式 (Canonical mode)，按行输入，会默认绑定一些按键如 C-c
+2. 不规范模式 (Noncanonical mode / Raw mode)，不按行输入，程序可以立即处理每一个按键
+
+用 =enableRawMode= 进入 Raw mode
+
+- =unix.IoctlGetTermios= 获得当前的 Termios
+  - =unix.Stdin= 是 stdin 的文件描述符，也就是 1
+  - =unix.TIOCGETA= 表示「获得 Termios 结构」，依据 macOS 的 =/usr/include/sys/ttycom.h= ，注意 Linux 下不是这个名字
+- 修改各种 Flag，L 表示 Local，I 表示 Input，O 表示 Output
+- MIN = 1, TIME = 0 阻塞式读取，一次读取一个 byte，也就是用户每按一次键盘就读取一次
+- =unix.IoctlSetTermios= 设置更新过的 Termios 
+  - =unix.TIOCSETA= 表示「设置 Termios 结构」
+
+#+BEGIN_SRC go
+func enableRawMode() error {
+	raw, err := unix.IoctlGetTermios(unix.Stdin, unix.TIOCGETA)
+	if err != nil {
+		return err
+	}
+	raw.Lflag &^= unix.ICANON | unix.ISIG | unix.IEXTEN | unix.ECHO
+	raw.Iflag &^= unix.BRKINT | unix.ICRNL | unix.IGNBRK | unix.IGNCR |
+		unix.INLCR | unix.INPCK | unix.ISTRIP | unix.IXON | unix.PARMRK
+	raw.Oflag &^= unix.OPOST
+	raw.Cc[unix.VMIN] = 1		// Character-at-a-time input
+	raw.Cc[unix.VTIME] = 0		// with blocking
+	return unix.IoctlSetTermios(unix.Stdin, unix.TIOCSETA, raw)
+}
+#+END_SRC
+
+注意我没有恢复原来的 Termios，因为我发现 Fish（我目前用的 Shell）会自动恢复。
+
+* 按 q 退出
+
+用一个 byte 表示一个按键，获得一个按键：
+
+#+BEGIN_SRC go
+func readKey() (byte, error) {
+	buf := make([]byte, 1)
+	_, err := os.Stdin.Read(buf)
+	return buf[0], err
+}
+#+END_SRC
+
+写个死循环不断读取按键，遇到 q 就退出。
+
+#+BEGIN_SRC go
+func main() {
+	if err := enableRawMode(); err != nil {
+		log.Fatal(err)
+	}
+
+	for {
+		key, err := readKey()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if key == 'q' {
+			return
+		}
+		os.Stdout.Write([]byte{key})
+	}
+}
+#+END_SRC
+
+* 清屏
+
+用 VT100 escape sequence =<ESC>[2J= 清屏：
+
+#+BEGIN_SRC go
+os.Stdout.Write([]byte("\x1b[2J"))
+#+END_SRC
+
+- =\x1b= 即 =27= 表示 Escape 字符
+- =<ESC>[= 表示这是个 escape sequence
+- =J= 是清屏命令， =2= 是其参数，表示整个屏幕
+
+* 重置光标位置
+
+=H= 命令用来移动光标，接收第几行第几列两个参数，缺省为第一行第一列。重置光标到开头：
+
+#+BEGIN_SRC go
+os.Stdout.Write([]byte("\x1b[H"))
+#+END_SRC
+
+假如要移动到 80 列 x 24 行的终端的中心：
+
+#+BEGIN_SRC go
+os.Stdout.Write([]byte("\x1b[12;40H"))
+#+END_SRC
+
+多个参数用分号隔开。
+
+* 读取文件内容
+
+用 =[]string= 表示文件内容：
+
+#+BEGIN_SRC go
+func readFile(name string) ([]string, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var lines []string
+	input := bufio.NewScanner(f)
+	for input.Scan() {
+		lines = append(lines, input.Text())
+	}
+	if err := input.Err(); err != nil {
+		return nil, err
+	}
+	return lines, nil
+}
+#+END_SRC
+
+Pager 一般是从 STDIN 读入文件，但是我一直在假设 STDIN/STDOUT 当作终端设备，所以暂时只允许文件名。
+
+* 显示文件内容
+
+"\n" 换行，"\r" 重置光标到行首：
+
+#+BEGIN_SRC go
+lines, err := readFile(os.Args[1])
+if err != nil {
+	log.Fatal(err)
+}
+for _, line := range lines {
+	os.Stdout.Write([]byte(line + "\n\r"))
+}
+#+END_SRC
+
+这样有个问题：当文件行数多于终端行数时，比如 100 行文件和 25 行终端，就只会限制文件的最后 25 行。
+
+* 获得终端高度
+
+为了实现方便，暂时不考虑终端宽度不够，就让它截断吧。
+
+#+BEGIN_SRC go
+func getHeight() (int, error) {
+	winsize, err := unix.IoctlGetWinsize(unix.Stdin, unix.TIOCGWINSZ)
+	if err != nil {
+		return 0, err
+	}
+	return int(winsize.Row), nil
+}
+#+END_SRC
+
+* 显示第一屏
+
+一个 25 行高度终端，显示 100 行文件，需要 4 屏。要显示第一屏，需要引入新状态， =rowOffset= 表示终端第一行和文件的偏移，第一屏 0，第二屏 25, 第三屏 50, 第四屏 75。它的有效范围是：
+
+#+BEGIN_EXAMPLE
+[0, 文件行数 - 终端高度]
+#+END_EXAMPLE
+
+=screenLines= 放着将要打印的行，如果行数太多就截断：
+
+#+BEGIN_SRC go
+screenLines := lines[rowOffset:]
+if len(screenLines) > height {
+	screenLines = lines[rowOffset:rowOffset+height]
+}
+os.Stdout.Write([]byte(strings.Join(screenLines, "\n\r")))
+#+END_SRC
+
+* 上下滚屏
+
+
+| Key | Function     |
+|-----+--------------|
+| n   | 向下滚动一行 |
+| p   | 向上滚动一行 |
+| SPC | 向下滚动一屏 |
+| DEL | 向上滚动一屏 |
+| g   | 开头         |
+| G   | 结尾         |
+
+#+BEGIN_SRC go
+var change int
+switch key {
+case 'q':
+	return
+case 'n':
+	change = 1
+case 'p':
+	change = -1
+case ' ':
+	change = height
+case 127: // DEL
+	change = -height
+case 'g':
+	change = -rowOffsetMax
+case 'G':
+	change = rowOffsetMax
+}
+newOffset := updateOffset(change)
+if newOffset != rowOffset {
+	rowOffset = newOffset
+	refresh()
+}
+#+END_SRC
+
+根据按键更新 =rowOffset= ，发现其有改动时就刷新。
+
+* 全部代码
+
+共 139 行代码
+
+#+BEGIN_SRC go
+package main
+
+import (
+	"bufio"
+	"log"
+	"os"
+	"strings"
+
+	"golang.org/x/sys/unix"
+)
+
+var (
+	height       int
+	rowOffset    int
+	rowOffsetMax int
+	lines        []string
+)
+
+func main() {
+	if err := enableRawMode(); err != nil {
+		log.Fatal(err)
+	}
+
+	var err error
+	height, err = getHeight()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	lines, err = readFile(os.Args[1])
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	rowOffset = 0
+	rowOffsetMax = len(lines) - height
+	if rowOffsetMax < 0 {
+		rowOffsetMax = 0
+	}
+
+	refresh()
+	for {
+		key, err := readKey()
+		if err != nil {
+			log.Fatal(err)
+		}
+		var change int
+		switch key {
+		case 'q':
+			return
+		case 'n':
+			change = 1
+		case 'p':
+			change = -1
+		case ' ':
+			change = height
+		case 127: // DEL
+			change = -height
+		case 'g':
+			change = -rowOffsetMax
+		case 'G':
+			change = rowOffsetMax
+		}
+		newOffset := updateOffset(change)
+		if newOffset != rowOffset {
+			rowOffset = newOffset
+			refresh()
+		}
+	}
+}
+
+func updateOffset(change int) int {
+	newOffset := rowOffset + change
+	if newOffset < 0 {
+		return 0
+	}
+	if newOffset > rowOffsetMax {
+		return rowOffsetMax
+	}
+	return newOffset
+}
+
+func refresh() {
+	os.Stdout.Write([]byte("\x1b[2J"))
+	os.Stdout.Write([]byte("\x1b[H"))
+
+	screenLines := lines[rowOffset:]
+	if len(screenLines) > height {
+		screenLines = lines[rowOffset : rowOffset+height]
+	}
+	os.Stdout.Write([]byte(strings.Join(screenLines, "\n\r")))
+}
+
+func readFile(name string) ([]string, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var lines []string
+	input := bufio.NewScanner(f)
+	for input.Scan() {
+		lines = append(lines, input.Text())
+	}
+	if err := input.Err(); err != nil {
+		return nil, err
+	}
+	return lines, nil
+}
+
+func readKey() (byte, error) {
+	buf := make([]byte, 1)
+	_, err := os.Stdin.Read(buf)
+	return buf[0], err
+}
+
+func enableRawMode() error {
+	raw, err := unix.IoctlGetTermios(unix.Stdin, unix.TIOCGETA)
+	if err != nil {
+		return err
+	}
+	raw.Lflag &^= unix.ICANON | unix.ISIG | unix.IEXTEN | unix.ECHO
+	raw.Iflag &^= unix.BRKINT | unix.ICRNL | unix.IGNBRK | unix.IGNCR |
+		unix.INLCR | unix.INPCK | unix.ISTRIP | unix.IXON | unix.PARMRK
+	raw.Oflag &^= unix.OPOST
+	raw.Cc[unix.VMIN] = 1  // Character-at-a-time input
+	raw.Cc[unix.VTIME] = 0 // with blocking
+	return unix.IoctlSetTermios(unix.Stdin, unix.TIOCSETA, raw)
+}
+
+func getHeight() (int, error) {
+	winsize, err := unix.IoctlGetWinsize(unix.Stdin, unix.TIOCGWINSZ)
+	if err != nil {
+		return 0, err
+	}
+	return int(winsize.Row), nil
+}
+#+END_SRC
+
+* 还存在问题
+
+1. 没有区分 STDIN/STDOUT 和终端设备，这样 =ls | go run .= 用不了
+2. 必须一次性读入输入，less(1) 支持 =yes | less=
+
+如果要日常用，还应该实现搜索功能。
