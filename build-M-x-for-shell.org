@@ -1,0 +1,399 @@
+#+TITLE: 实现 Shell 下的 M-x
+
+Emacs 的 =M-x= 体现了「Everything is a command」的特点，快捷键仅仅是命令的别称，因此就算你只用一个快捷键也能用 Emacs 所有的功能。
+
+下面用 Go 给 Shell 实现一个类似的，用户可以通过命令名和描述查找命令，比如输入 =gre= ，就会提示 =grep= =zgrep= =pdfgrep= 等。更类似于 =helm-M-x= 。
+
+* 获得所有的外部命令
+
+无视 Shell 预设命令、用户自定义函数 和 Alias，只关心 =PATH= 下的可执行文件。
+
+获得所有的 =PATH= ：
+
+#+BEGIN_SRC go
+var paths = strings.Split(os.Getenv("PATH"), ":")
+#+END_SRC
+
+获得一个 =PATH= 下的所有可执行文件，考虑 =info.Mode()&0o111= ，得 0 则一个 x 也没设，否则至少一个 x 设了
+
+#+BEGIN_EXAMPLE
+rwx rwx rwx
+001 001 001
+#+END_EXAMPLE
+
+#+BEGIN_SRC go
+// readPath returns executable files in path.
+func readPath(path string) ([]string, error) {
+	fileinfos, err := ioutil.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	var cmds []string
+	for _, info := range fileinfos {
+		if !info.IsDir() && info.Mode()&0o111 != 0 {
+			cmds = append(cmds, info.Name())
+		}
+	}
+	return cmds, nil
+}
+#+END_SRC
+
+接下来获得所有命令
+
+#+BEGIN_SRC go
+var commands []string
+
+func getCommands() error {
+	for _, p := range paths {
+		cmds, err := readPath(p)
+		if err != nil {
+			return err
+		}
+		commands = append(commands, cmds...)
+	}
+	return nil
+}
+#+END_SRC
+
+* 获得命令的简短描述
+
+Manual Page 提供了命令的简短描述，比如：
+
+#+BEGIN_EXAMPLE
+~ $ whatis grep
+pcre2grep(1)             - a grep with Perl-compatible regular expressions
+pcregrep(1)              - a grep with Perl-compatible regular expressions
+grep(1), egrep(1), fgrep(1), zgrep(1), zegrep(1), zfgrep(1) - file pattern searcher
+#+END_EXAMPLE
+
+我们可以把它抠出来，让用户能同时搜索命令和描述。Man Page 把这些信息保存在 whatis 文件中，比如
+
+#+BEGIN_EXAMPLE
+~ $ head -1 /usr/share/man/whatis
+AEServer(8)              - AEServer(8) -- System-wide daemon which recevies incoming (remote) AppleEvents
+#+END_EXAMPLE
+
+每一个 =man= 文件夹下都有 =whatis= ，所以要先把所有的 =man= 文件夹找出来，我的 Shell 没有环境变量 =MANPATH= ，可以用 =manpath(1)=
+
+#+BEGIN_EXAMPLE
+~ $ manpath
+/usr/local/share/man:/usr/share/man:/opt/X11/share/man:/Library/Developer/CommandLineTools/usr/share/man
+#+END_EXAMPLE
+
+#+BEGIN_SRC go
+func manpaths() ([]string, error) {
+	b, err := exec.Command("manpath").Output()
+	if err != nil {
+		return nil, err
+	}
+	return strings.Split(strings.TrimSpace(string(b)), ":"), nil
+}
+#+END_SRC
+
+接下来找出 whatis 文件，并解析，保存到 Map 中备用：
+
+#+BEGIN_SRC go
+map[string]string{
+	{"ls", "list directory contents"},
+	{"grep", "file pattern searcher"},
+}
+#+END_SRC
+
+* 实现终端逻辑
+
+程序启动时，进入 Alternative screen buffer、隐藏光标、进入 Raw mode。退出时取消这些设置。
+
+读取用户按键，更新 UI。
+
+* 全部代码
+
+283 行。
+
+#+BEGIN_SRC go
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"unicode"
+
+	"golang.org/x/sys/unix"
+)
+
+var paths = strings.Split(os.Getenv("PATH"), ":")
+
+// readPath returns executable files in path.
+func readPath(path string) ([]string, error) {
+	fileinfos, err := ioutil.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	var cmds []string
+	for _, info := range fileinfos {
+		if !info.IsDir() && info.Mode()&0o111 != 0 {
+			cmds = append(cmds, info.Name())
+		}
+	}
+	return cmds, nil
+}
+
+var commands []string
+
+func getCommands() error {
+	for _, p := range paths {
+		cmds, err := readPath(p)
+		if err != nil {
+			return err
+		}
+		commands = append(commands, cmds...)
+	}
+	return nil
+}
+
+// var manpaths
+
+func manpaths() ([]string, error) {
+	b, err := exec.Command("manpath").Output()
+	if err != nil {
+		return nil, err
+	}
+	return strings.Split(strings.TrimSpace(string(b)), ":"), nil
+}
+
+func whatisFiles() ([]string, error) {
+	var result []string
+	ps, err := manpaths()
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range ps {
+		dirExists, err := exists(p)
+		if err != nil {
+			return nil, err
+		}
+		if !dirExists {
+			continue
+		}
+		fullpath := filepath.Join(p, "whatis")
+		fileExists, err := exists(fullpath)
+		if err != nil {
+			return nil, err
+		}
+		if fileExists {
+			result = append(result, fullpath)
+		}
+	}
+	return result, nil
+}
+
+// exists tests if filename exists
+func exists(filename string) (bool, error) {
+	_, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// grep(1) => grep, 1
+func parseCmd(s string) (string, string) {
+	re := regexp.MustCompile(`(.*)\((.*)\)`)
+	matches := re.FindAllStringSubmatch(s, -1)
+	if len(matches) == 0 {
+		log.Print(s)
+		return "", ""
+	}
+	match := matches[0]
+	return match[1], match[2]
+}
+
+func parseLine(s string) {
+	twoParts := strings.SplitN(s, " - ", 2)
+	if len(twoParts) != 2 {
+		log.Print(s)
+		return
+	}
+	cmds := strings.Split(strings.TrimSpace(twoParts[0]), ", ")
+	desc := strings.TrimSpace(twoParts[1])
+	for _, c := range cmds {
+		cmd, section := parseCmd(c)
+		if section == "1" || section == "8" {
+			if _, ok := index[cmd]; ok {
+				index[cmd] = desc
+			}
+		}
+	}
+}
+
+var index = make(map[string]string)
+
+func buildIndex() error {
+	if err := getCommands(); err != nil {
+		return err
+	}
+	for _, c := range commands {
+		index[c] = ""
+	}
+	files, err := whatisFiles()
+	if err != nil {
+		return err
+	}
+	for _, name := range files {
+		f, err := os.Open(name)
+		if err != nil {
+			return err
+		}
+		input := bufio.NewScanner(f)
+		for input.Scan() {
+			parseLine(input.Text())
+		}
+		if err := input.Err(); err != nil {
+			return err
+		}
+		f.Close()
+	}
+	return nil
+}
+
+func init() {
+	if err := buildIndex(); err != nil {
+		log.Print(err)
+	}
+}
+
+func setup() {
+	// Enable alternative screen buffer
+	os.Stdout.Write([]byte("\x1b[?1049h"))
+	// DECTCEM Hides the cursor
+	os.Stdout.Write([]byte("\x1b[?25l"))
+	if err := enableRawMode(1); err != nil {
+		log.Fatal(err)
+	}
+	var err error
+	height, width, err = getHeightWidth()
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func restore() {
+	// Disable alternative screen buffer
+	os.Stdout.Write([]byte("\x1b[?1049l"))
+	// DECTCEM Shows the cursor, from the VT320.
+	os.Stdout.Write([]byte("\x1b[?25h"))
+	err := unix.IoctlSetTermios(1, unix.TIOCSETA, &userTermios)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+var userTermios unix.Termios
+
+func enableRawMode(fd int) error {
+	raw, err := unix.IoctlGetTermios(fd, unix.TIOCGETA)
+	if err != nil {
+		return err
+	}
+	userTermios = *raw
+	raw.Lflag &^= unix.ICANON | unix.ISIG | unix.IEXTEN | unix.ECHO
+	raw.Iflag &^= unix.BRKINT | unix.ICRNL | unix.IGNBRK | unix.IGNCR |
+		unix.INLCR | unix.INPCK | unix.ISTRIP | unix.IXON | unix.PARMRK
+	raw.Oflag &^= unix.OPOST
+	raw.Cc[unix.VMIN] = 1  // Character-at-a-time input
+	raw.Cc[unix.VTIME] = 0 // with blocking
+	return unix.IoctlSetTermios(fd, unix.TIOCSETA, raw)
+}
+
+var userInput string
+
+func main() {
+	setup()
+	defer restore()
+
+	refresh()
+	for {
+		key, err := readKey()
+		if err != nil {
+			log.Fatal(err)
+		}
+		switch key {
+		case 17: // C-q
+			return
+		case 127: // DEL
+			if userInput != "" {
+				userInput = userInput[:len(userInput)-1]
+			}
+		default:
+			if unicode.IsLetter(rune(key)) {
+				userInput += string(key)
+			}
+		}
+		refresh()
+		// fmt.Println(key)
+	}
+}
+
+func refresh() {
+	os.Stdout.Write([]byte("\x1b[2J"))
+	os.Stdout.Write([]byte("\x1b[H"))
+
+	fmt.Printf("\x1b[32mM-x\x1b[0m %s\n\r", userInput)
+	matches := search()
+	if len(matches) > height-1 {
+		matches = matches[:height-1]
+	}
+	displayLines := make([]string, len(matches))
+	for i, m := range matches {
+		if index[m] == "" {
+			displayLines[i] = m
+		} else {
+			line := m + " - " + index[m]
+			if len(line) > width {
+				line = line[:width]
+			}
+			displayLines[i] = line
+		}
+	}
+	os.Stdout.Write([]byte(strings.Join(displayLines, "\n\r")))
+}
+
+func search() []string {
+	if userInput == "" {
+		return commands
+	}
+	var matches []string
+	for _, c := range commands {
+		if strings.Contains(c, userInput) || strings.Contains(index[c], userInput) {
+			matches = append(matches, c)
+		}
+	}
+	return matches
+}
+
+func readKey() (byte, error) {
+	buf := make([]byte, 1)
+	_, err := os.Stdin.Read(buf)
+	return buf[0], err
+}
+
+var height int
+var width int
+
+func getHeightWidth() (int, int, error) {
+	winsize, err := unix.IoctlGetWinsize(1, unix.TIOCGWINSZ)
+	if err != nil {
+		return 0, 0, err
+	}
+	return int(winsize.Row), int(winsize.Col), nil
+}
+#+END_SRC
